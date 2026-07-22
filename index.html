@@ -1,0 +1,1348 @@
+<!DOCTYPE html>
+<!--
+  HidroUNLAM Dashboard — v7
+
+  Changelog:
+    v1 — Dashboard inicial: sensores en tiempo real, historial, control LimitTDS, log
+    v2 — Fix de topics MQTT (casing exacto), estado de agua con 2 valores (ok/low)
+    v3 — Estado de agua con 3 valores (ok/checking/low) sincronizado con debounce del STM32
+    v4 — Configuración de email para alertas (HidroUNLAM/config/email)
+    v5 — Badge de estado del STM32 independiente del badge de conexión MQTT
+    v6 — Email en header, log reubicado antes de controles, LimitTDS con dropdown
+    v8 — Fix regex agua: (antes water:), simulador de pruebas separado
+    v9 — Umbrales de temperatura alineados con STM32, textos TDS sin ambigüedad
+-->
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HidroUNLAM — Monitor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;600&family=Raleway:wght@300;400;500;600;700&family=DM+Mono:wght@300;400&display=swap');
+
+:root {
+  --bg:         #090b09;
+  --surface:    #0f130f;
+  --card:       #121812;
+  --border:     #1c241c;
+  --border-h:   #2e3e2e;
+  --green:      #4caf7d;
+  --green-l:    #6fcf97;
+  --green-d:    #2d7a52;
+  --green-glow: rgba(76,175,125,0.12);
+  --amber:      #e8a84c;
+  --amber-d:    #c47d1a;
+  --red:        #e06060;
+  --text:       #b8ccb8;
+  --muted:      #4a604a;
+  --white:      #e8f0e8;
+  --mono:       'DM Mono', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Raleway', sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ── NOISE TEXTURE ── */
+body::before {
+  content: '';
+  position: fixed; inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+  pointer-events: none; z-index: 0; opacity: .6;
+}
+
+/* ── LAYOUT ── */
+.app {
+  position: relative; z-index: 1;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 32px 20px 60px;
+}
+
+/* ── HEADER ── */
+header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  margin-bottom: 48px;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.brand-block {}
+
+.brand {
+  font-family: 'Cormorant Garamond', serif;
+  font-weight: 300;
+  font-size: clamp(28px, 6vw, 42px);
+  letter-spacing: 5px;
+  text-transform: uppercase;
+  color: var(--white);
+  line-height: 1;
+}
+.brand strong { font-weight: 600; color: var(--green-l); }
+
+.brand-sub {
+  margin-top: 6px;
+  font-size: 10px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+/* ── CONNECTION STATUS ── */
+.conn-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  font-weight: 600;
+  transition: all .3s;
+  background: var(--surface);
+}
+
+.conn-badge.connecting { color: var(--amber); border-color: var(--amber-d); }
+.conn-badge.connected  { color: var(--green); border-color: var(--green-d); }
+.conn-badge.error      { color: var(--red);   border-color: #7a3030; }
+
+.conn-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.conn-badge.connecting .conn-dot { animation: blink 1s ease-in-out infinite; }
+.conn-badge.connected  .conn-dot { animation: blink 3s ease-in-out infinite; }
+
+/* ── BADGES WRAPPER ── */
+.badges {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* ── EMAIL EN HEADER ── */
+.header-email {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  letter-spacing: .5px;
+  color: var(--text);
+  font-family: var(--mono);
+}
+
+.header-email-label { color: var(--green); font-size: 14px; }
+
+/* ── STM32 STATUS BADGE ── */
+.stm-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  font-weight: 600;
+  transition: all .3s;
+  background: var(--surface);
+}
+
+.stm-badge.online   { color: var(--green); border-color: var(--green-d); }
+.stm-badge.offline  { color: var(--red);   border-color: #7a3030; }
+.stm-badge.waiting  { color: var(--muted); border-color: var(--border); }
+
+.stm-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.stm-badge.online .stm-dot { animation: blink 3s ease-in-out infinite; }
+
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
+
+/* ── SECTION LABEL ── */
+.section-label {
+  font-size: 9px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.section-label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* ── SENSOR CARDS ── */
+.sensors-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 40px;
+}
+
+@media (max-width: 480px) {
+  .sensors-grid { grid-template-columns: 1fr; }
+}
+
+.sensor-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 24px;
+  position: relative;
+  overflow: hidden;
+  transition: border-color .3s;
+}
+
+.sensor-card:hover { border-color: var(--border-h); }
+
+.sensor-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent-color, var(--green)), transparent);
+  opacity: .6;
+}
+
+.sensor-card.temp  { --accent-color: var(--amber); }
+.sensor-card.tds   { --accent-color: var(--green); }
+
+.sensor-icon {
+  font-size: 20px;
+  margin-bottom: 16px;
+  line-height: 1;
+}
+
+.sensor-label {
+  font-size: 9px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.sensor-value {
+  font-family: 'Cormorant Garamond', serif;
+  font-weight: 300;
+  font-size: clamp(42px, 8vw, 58px);
+  line-height: 1;
+  color: var(--white);
+  transition: color .4s;
+}
+
+.sensor-unit {
+  font-family: 'Raleway', sans-serif;
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 4px;
+}
+
+.sensor-meta {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sensor-time {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.sensor-status {
+  font-size: 9px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  font-weight: 600;
+  padding: 3px 7px;
+  border-radius: 2px;
+}
+
+.status-ok      { color: var(--green);  background: rgba(76,175,125,.1); }
+.status-warn    { color: var(--amber);  background: rgba(232,168,76,.1); }
+.status-high    { color: var(--red);    background: rgba(224,96,96,.1);  }
+.status-waiting { color: var(--muted);  background: rgba(74,96,74,.1);   }
+
+/* ── WATER ALERT BADGE ── */
+.water-alert {
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: rgba(224,96,96,.08);
+  border: 1px solid rgba(224,96,96,.35);
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  letter-spacing: .5px;
+  color: var(--red);
+  animation: alertPulse 2s ease-in-out infinite;
+}
+
+.water-alert.checking {
+  background: rgba(232,168,76,.08);
+  border-color: rgba(232,168,76,.35);
+  color: var(--amber);
+  animation: checkingPulse 1.2s ease-in-out infinite;
+}
+
+/* ── TEMP ALERT — variantes de color ── */
+.water-alert.temp-cold {
+  background: rgba(77,166,255,.08);
+  border-color: rgba(77,166,255,.35);
+  color: #4da6ff;
+  animation: tempColdPulse 2s ease-in-out infinite;
+}
+
+.water-alert.temp-hot {
+  background: rgba(232,168,76,.08);
+  border-color: rgba(232,168,76,.35);
+  color: var(--amber);
+  animation: tempHotPulse 2s ease-in-out infinite;
+}
+
+.water-alert-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+@keyframes alertPulse {
+  0%, 100% { border-color: rgba(224,96,96,.35); }
+  50%      { border-color: rgba(224,96,96,.8); }
+}
+
+@keyframes checkingPulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .55; }
+}
+
+@keyframes tempColdPulse {
+  0%, 100% { border-color: rgba(77,166,255,.35); }
+  50%      { border-color: rgba(77,166,255,.8); }
+}
+
+@keyframes tempHotPulse {
+  0%, 100% { border-color: rgba(232,168,76,.35); }
+  50%      { border-color: rgba(232,168,76,.8); }
+}
+
+/* ── HISTORY CHART ── */
+.chart-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 24px;
+  margin-bottom: 40px;
+}
+
+.chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.chart-title {
+  font-size: 11px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.chart-legend {
+  display: flex;
+  gap: 16px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--muted);
+}
+
+.legend-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+}
+
+.chart-wrap {
+  position: relative;
+  height: 180px;
+}
+
+canvas#chart {
+  width: 100% !important;
+  height: 180px !important;
+}
+
+.chart-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 2px;
+}
+
+/* ── CONTROL PANEL ── */
+.control-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 24px;
+  margin-bottom: 40px;
+}
+
+.control-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.control-field { flex: 1; min-width: 160px; }
+
+.control-field label {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.control-field .hint {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+/* ── EMAIL CONFIG ── */
+.current-email-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-bottom: 16px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.current-email-label {
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.current-email-value {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--green-l);
+}
+
+input[type=text]#emailInput {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 400;
+  padding: 13px 14px;
+}
+
+/* ── SELECT (LimitTDS dropdown) ── */
+select#limitSelect {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--white);
+  font-family: 'Raleway', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 12px 36px 12px 14px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color .2s;
+  -webkit-appearance: none;
+  appearance: none;
+}
+select#limitSelect:focus { border-color: var(--green); }
+select#limitSelect option {
+  background: var(--surface);
+  color: var(--white);
+  font-size: 14px;
+}
+
+/* ── CUSTOM PPM INPUT ── */
+input[type=number]#limitInput {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--white);
+  font-family: 'Raleway', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 12px 14px;
+  outline: none;
+  transition: border-color .2s;
+  -moz-appearance: textfield;
+}
+input[type=number]#limitInput::-webkit-inner-spin-button,
+input[type=number]#limitInput::-webkit-outer-spin-button { -webkit-appearance: none; }
+input[type=number]#limitInput:focus { border-color: var(--green); }
+
+/* ── SELECT ARROW ── */
+.input-wrap .select-arrow {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted);
+  pointer-events: none;
+  font-size: 12px;
+}
+
+.btn-send {
+  background: transparent;
+  border: 1px solid var(--green);
+  color: var(--green-l);
+  font-family: 'Raleway', sans-serif;
+  font-weight: 700;
+  font-size: 10px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  padding: 13px 24px;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background .25s, color .25s;
+  white-space: nowrap;
+  height: 54px;
+}
+.btn-send:hover  { background: var(--green); color: var(--bg); }
+.btn-send:active { opacity: .8; }
+.btn-send:disabled {
+  opacity: .3; cursor: not-allowed;
+  border-color: var(--muted); color: var(--muted);
+}
+
+.ack-msg {
+  margin-top: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--green);
+  min-height: 16px;
+  transition: opacity .4s;
+}
+
+/* ── LOG ── */
+.log-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 24px;
+}
+
+.log-header {
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.log-title {
+  font-size: 9px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.btn-clear {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  cursor: pointer;
+  font-family: 'Raleway', sans-serif;
+  padding: 0;
+  transition: color .2s;
+}
+.btn-clear:hover { color: var(--text); }
+
+.log-body {
+  padding: 12px 20px;
+  max-height: 180px;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.8;
+}
+
+.log-body::-webkit-scrollbar { width: 4px; }
+.log-body::-webkit-scrollbar-track { background: var(--bg); }
+.log-body::-webkit-scrollbar-thumb { background: var(--border-h); border-radius: 2px; }
+
+.log-entry { display: flex; gap: 12px; }
+.log-time  { color: var(--muted); flex-shrink: 0; }
+.log-topic { color: var(--green-d); flex-shrink: 0; }
+.log-val   { color: var(--text); }
+
+/* ── ANIMATIONS ── */
+.value-flash {
+  animation: flash .6s ease;
+}
+@keyframes flash {
+  0%   { color: var(--white); }
+  30%  { color: var(--green-l); }
+  100% { color: var(--white); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.sensor-card, .chart-card, .control-card, .log-card {
+  animation: fadeIn .5s ease both;
+}
+.sensor-card:nth-child(2) { animation-delay: .08s; }
+.chart-card               { animation-delay: .16s; }
+.control-card             { animation-delay: .24s; }
+.log-card                 { animation-delay: .32s; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- HEADER -->
+  <header>
+    <div class="brand-block">
+      <div class="brand">Hidro<strong>UNLAM</strong></div>
+      <div class="brand-sub">Sistema de monitoreo hidropónico</div>
+    </div>
+    <div class="badges">
+      <div class="conn-badge connecting" id="connBadge">
+        <div class="conn-dot"></div>
+        <span id="connText">Conectando</span>
+      </div>
+      <div class="stm-badge waiting" id="stmBadge">
+        <div class="stm-dot"></div>
+        <span id="stmText">STM32 — esperando datos</span>
+      </div>
+      <div class="header-email" id="headerEmail" style="display:none;">
+        <span class="header-email-label">✉</span>
+        <span id="headerEmailVal">—</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- SENSORES -->
+  <div class="section-label">Sensores en tiempo real</div>
+  <div class="sensors-grid">
+
+    <div class="sensor-card temp">
+      <div class="sensor-icon">🌡</div>
+      <div class="sensor-label">Temperatura</div>
+      <div class="sensor-value" id="valTemp">
+        —<span class="sensor-unit">°C</span>
+      </div>
+      <div class="sensor-meta">
+        <span class="sensor-time" id="timeTemp">Sin datos</span>
+        <span class="sensor-status status-waiting" id="statusTemp">Esperando</span>
+      </div>
+      <div class="water-alert" id="tempAlert" style="display:none;">
+        <span class="water-alert-icon" id="tempAlertIcon">🌡</span>
+        <span id="tempAlertText">Temperatura fuera de rango</span>
+      </div>
+    </div>
+
+    <div class="sensor-card tds">
+      <div class="sensor-icon">💧</div>
+      <div class="sensor-label">TDS — Conductividad</div>
+      <div class="sensor-value" id="valTDS">
+        —<span class="sensor-unit">ppm</span>
+      </div>
+      <div class="sensor-meta">
+        <span class="sensor-time" id="timeTDS">Sin datos</span>
+        <span class="sensor-status status-waiting" id="statusTDS">Esperando</span>
+      </div>
+      <div class="water-alert" id="waterAlert" style="display:none;">
+        <span class="water-alert-icon" id="waterAlertIcon">⚠</span>
+        <span id="waterAlertText">Nivel de agua bajo — verificar tanque</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- HISTORIAL -->
+  <div class="section-label">Historial — últimas 30 lecturas</div>
+  <div class="chart-card">
+    <div class="chart-header">
+      <span class="chart-title">Evolución temporal</span>
+      <div class="chart-legend">
+        <div class="legend-item">
+          <div class="legend-dot" style="background:var(--amber)"></div>
+          <span>Temp °C</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot" style="background:var(--green)"></div>
+          <span>TDS ppm ÷ 10</span>
+        </div>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="chart"></canvas>
+      <div class="chart-empty" id="chartEmpty">Esperando datos...</div>
+    </div>
+  </div>
+
+  <!-- LOG -->
+  <div class="section-label">Log de mensajes</div>
+  <div class="log-card">
+    <div class="log-header">
+      <span class="log-title">MQTT — mensajes recibidos</span>
+      <button class="btn-clear" onclick="clearLog()">Limpiar</button>
+    </div>
+    <div class="log-body" id="logBody">
+      <div class="log-entry">
+        <span class="log-time">--:--:--</span>
+        <span class="log-val" style="color:var(--muted)">Esperando conexión al broker...</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONTROL -->
+  <div class="section-label">Control remoto</div>
+  <div class="control-card">
+    <div class="control-row">
+      <div class="control-field">
+        <label for="limitSelect">Límite TDS</label>
+        <div class="input-wrap">
+		<select id="limitSelect" onchange="onLimitSelect(this)">
+		  <option value="200">200 ppm — Plantín (bajo)</option>
+		  <option value="400" selected>400 ppm — Plantín (alto)</option>
+		  <option value="450">450 ppm — Vegetación (bajo)</option>
+		  <option value="600">600 ppm — Vegetación (alto)</option>
+		  <option value="700">700 ppm — Floración (bajo)</option>
+		  <option value="900">900 ppm — Floración (alto)</option>
+		  <option value="__custom__">Personalizado...</option>
+		</select>
+          <span class="select-arrow">▾</span>
+        </div>
+        <div id="customLimitWrap" style="display:none; margin-top:8px;">
+          <input type="number" id="limitInput" min="0" max="5000"
+                 placeholder="Ingresá el valor en ppm">
+          <div class="hint">Rango válido: 0 – 5000 ppm</div>
+        </div>
+      </div>
+      <button class="btn-send" id="btnSend" onclick="sendLimit()" disabled>
+        Publicar
+      </button>
+    </div>
+    <div class="ack-msg" id="ackMsg"></div>
+  </div>
+
+  <!-- ALERTAS POR EMAIL -->
+  <div class="section-label">Alertas por email</div>
+  <div class="control-card">
+    <div class="control-row">
+      <div class="control-field">
+        <label for="emailInput">Email para alertas</label>
+        <input type="text" id="emailInput"
+               placeholder="usuario@ejemplo.com" autocomplete="email">
+        <div class="hint">Se usará para avisos de nivel de agua bajo</div>
+      </div>
+      <button class="btn-send" id="btnSendEmail" onclick="sendEmail()" disabled>
+        Guardar
+      </button>
+    </div>
+    <div class="ack-msg" id="emailAckMsg"></div>
+  </div>
+
+</div><!-- /app -->
+
+<script>
+/* ══════════════════════════════════════════════════
+   CONFIGURACIÓN
+   
+   Convención de topics MQTT del proyecto HidroUNLAM:
+     HidroUNLAM/<Medición>          → datos de sensores (solo lectura)
+     HidroUNLAM/config/<Parámetro>  → parámetros configurables (lectura/escritura)
+     HidroUNLAM/config/<Parámetro>/ack → confirmación del STM32 tras aplicar el cambio
+══════════════════════════════════════════════════ */
+const BROKER   = 'broker.hivemq.com';
+const PORT     = 8884;                    // WebSocket seguro (WSS) de HiveMQ público
+const CLIENT_ID = 'HidroWeb_' + Math.random().toString(36).substr(2, 8);
+
+const TOPICS = {
+  temp      : 'HidroUNLAM/Temperatura',
+  tds       : 'HidroUNLAM/TDS',
+  ack       : 'HidroUNLAM/config/limitTDS/ack',
+  limit     : 'HidroUNLAM/config/limitTDS',
+  email     : 'HidroUNLAM/config/email',
+  emailAck  : 'HidroUNLAM/config/email/ack'
+};
+
+const MAX_HISTORY = 30;
+const TDS_LIMIT_DEFAULT = 500;
+
+/* ══════════════════════════════════════════════════
+   ESTADO
+══════════════════════════════════════════════════ */
+let client;
+let history = {
+  labels : [],
+  temp   : [],
+  tds    : []
+};
+let currentTDS   = null;
+let currentLimit = TDS_LIMIT_DEFAULT;
+let lastStmMessage = 0;          // timestamp del último mensaje del STM32
+const STM_TIMEOUT_MS = 30000;    // 30 segundos sin datos → desconectado
+
+/* ══════════════════════════════════════════════════
+   MQTT
+══════════════════════════════════════════════════ */
+function connect() {
+  setConnState('connecting', 'Conectando');
+  log('sys', 'Conectando a ' + BROKER + ':' + PORT + '...');
+
+  client = new Paho.MQTT.Client(BROKER, PORT, CLIENT_ID);
+
+  client.onConnectionLost = function(resp) {
+    setConnState('error', 'Desconectado');
+    log('sys', 'Conexión perdida: ' + (resp.errorMessage || 'unknown'));
+    document.getElementById('btnSend').disabled = true;
+    document.getElementById('btnSendEmail').disabled = true;
+    // Reintentar en 5s
+    setTimeout(connect, 5000);
+  };
+
+  client.onMessageArrived = onMessage;
+
+  client.connect({
+    onSuccess: onConnect,
+    onFailure: function(e) {
+      setConnState('error', 'Error');
+      log('sys', 'Fallo de conexión: ' + e.errorMessage);
+      setTimeout(connect, 5000);
+    },
+    useSSL: true,
+    keepAliveInterval: 30,
+    cleanSession: true
+  });
+}
+
+function onConnect() {
+  setConnState('connected', 'Conectado');
+  log('sys', 'Conectado como ' + CLIENT_ID);
+  document.getElementById('btnSend').disabled = false;
+  document.getElementById('btnSendEmail').disabled = false;
+
+  client.subscribe(TOPICS.temp,     { qos: 0 });
+  client.subscribe(TOPICS.tds,      { qos: 0 });
+  client.subscribe(TOPICS.ack,      { qos: 0 });
+  client.subscribe(TOPICS.email,    { qos: 0 });
+  client.subscribe(TOPICS.emailAck, { qos: 0 });
+  log('sys', 'Suscripto a ' + Object.values(TOPICS).join(', '));
+}
+
+function onMessage(msg) {
+  const topic   = msg.destinationName;
+  const payload = msg.payloadString.trim();
+  const now     = timeStr();
+
+  log(topic, payload);
+
+  if (topic === TOPICS.temp) {
+    lastStmMessage = Date.now();
+    updateStmBadge();
+    // Parsear "Temp: 24 C | temp:ok"
+    const match     = payload.match(/(-?\d+)/);
+    const tempMatch = payload.match(/temp:(\w+)/);
+
+    if (match) {
+      const val = parseInt(match[1]);
+      updateTemp(val, now);
+      pushHistory('temp', val, now);
+      drawChart();
+    }
+
+    if (tempMatch) {
+      updateTempAlert(tempMatch[1]);
+    }
+  }
+
+  else if (topic === TOPICS.tds) {
+    lastStmMessage = Date.now();
+    updateStmBadge();
+    // Parsear "TDS: 850 ppm | water:ok"
+    const valMatch   = payload.match(/(\d+)/);
+    const waterMatch = payload.match(/agua:(\w+)/);
+
+    if (valMatch) {
+      const val = parseInt(valMatch[1]);
+      currentTDS = val;
+      updateTDS(val, now);
+      pushHistory('tds', val, now);
+      drawChart();
+    }
+
+    if (waterMatch) {
+      updateWaterAlert(waterMatch[1]);
+    }
+  }
+
+  else if (topic === TOPICS.ack) {
+    showAck('✓ ' + payload);
+  }
+
+  else if (topic === TOPICS.emailAck) {
+    showEmailAck('✓ ' + payload);
+  }
+
+  else if (topic === TOPICS.email) {
+    // El STM32 publica el email actualmente configurado (retained o al conectar)
+    updateCurrentEmail(payload);
+  }
+}
+
+/* ══════════════════════════════════════════════════
+   UI — SENSORES
+══════════════════════════════════════════════════ */
+function updateTemp(val, time) {
+  const el = document.getElementById('valTemp');
+  el.innerHTML = val + '<span class="sensor-unit">°C</span>';
+  el.classList.remove('value-flash');
+  void el.offsetWidth;
+  el.classList.add('value-flash');
+
+  document.getElementById('timeTemp').textContent = time;
+
+  const st = document.getElementById('statusTemp');
+  if (val > 30)      { st.className='sensor-status status-high'; st.textContent='Calor'; }
+  else if (val < 15) { st.className='sensor-status status-warn'; st.textContent='Frío'; }
+  else               { st.className='sensor-status status-ok';   st.textContent='Normal'; }
+}
+
+function updateTDS(val, time) {
+  const el = document.getElementById('valTDS');
+  el.innerHTML = val + '<span class="sensor-unit">ppm</span>';
+  el.classList.remove('value-flash');
+  void el.offsetWidth;
+  el.classList.add('value-flash');
+
+  document.getElementById('timeTDS').textContent = time;
+
+  const st  = document.getElementById('statusTDS');
+  const lim = currentLimit;
+
+  if (val >= lim)          { st.className='sensor-status status-ok';   st.textContent='Normal'; }
+  else if (val < lim * 0.5){ st.className='sensor-status status-warn'; st.textContent='Bajo'; }
+  else                     { st.className='sensor-status status-ok';   st.textContent='Normal'; }
+}
+
+/* ══════════════════════════════════════════════════
+   STM32 STATUS BADGE
+══════════════════════════════════════════════════ */
+function updateStmBadge() {
+  const badge = document.getElementById('stmBadge');
+  const text  = document.getElementById('stmText');
+  const now   = Date.now();
+
+  if (lastStmMessage === 0) {
+    badge.className = 'stm-badge waiting';
+    text.textContent = 'STM32 — esperando datos';
+    return;
+  }
+
+  const elapsed = now - lastStmMessage;
+  if (elapsed < STM_TIMEOUT_MS) {
+    badge.className = 'stm-badge online';
+    text.textContent = 'STM32 — en línea';
+  } else {
+    badge.className = 'stm-badge offline';
+    // Mostrar cuánto tiempo lleva sin responder
+    const secs = Math.floor(elapsed / 1000);
+    const mins = Math.floor(secs / 60);
+    const timeStr = mins > 0 ? mins + ' min' : secs + 's';
+    text.textContent = 'STM32 — sin datos (' + timeStr + ')';
+  }
+}
+
+// Revisar el estado del STM32 cada 5 segundos aunque no lleguen mensajes nuevos
+setInterval(updateStmBadge, 5000);
+
+function updateWaterAlert(state) {
+  const el   = document.getElementById('waterAlert');
+  const icon = document.getElementById('waterAlertIcon');
+  const text = document.getElementById('waterAlertText');
+
+  if (state === 'bajo') {
+    el.style.display = 'flex';
+    el.className = 'water-alert';
+    icon.textContent = '⚠';
+    text.textContent = 'Nivel de agua bajo — verificar tanque';
+  }
+  else if (state === 'verificando') {
+    el.style.display = 'flex';
+    el.className = 'water-alert checking';
+    icon.textContent = '◌';
+    text.textContent = 'Verificando nivel de agua...';
+  }
+  else {
+    el.style.display = 'none';
+  }
+}
+
+function updateTempAlert(state) {
+  const el   = document.getElementById('tempAlert');
+  const icon = document.getElementById('tempAlertIcon');
+  const text = document.getElementById('tempAlertText');
+
+  if (state === 'frio') {
+    el.style.display = 'flex';
+    el.className = 'water-alert temp-cold';
+    icon.textContent = '🥶';
+    text.textContent = 'Temperatura baja — riesgo para el cultivo';
+  }
+  else if (state === 'calor') {
+    el.style.display = 'flex';
+    el.className = 'water-alert temp-hot';
+    icon.textContent = '🌡';
+    text.textContent = 'Temperatura alta — riesgo para el cultivo';
+  }
+  else {
+    el.style.display = 'none';
+  }
+}
+
+/* ══════════════════════════════════════════════════
+   HISTORIAL + CHART
+══════════════════════════════════════════════════ */
+function pushHistory(sensor, val, label) {
+  history[sensor].push(val);
+  if (!history.labels.includes(label) || sensor === 'temp') {
+    // Sincronizar etiquetas con temperatura (llega primero generalmente)
+  }
+  // Mantener ambos arrays alineados con labels comunes
+  if (sensor === 'temp') {
+    history.labels.push(label);
+    if (history.labels.length > MAX_HISTORY) history.labels.shift();
+  }
+  if (history[sensor].length > MAX_HISTORY) history[sensor].shift();
+}
+
+let chartCtx, chartInited = false;
+
+function drawChart() {
+  const canvas = document.getElementById('chart');
+  const empty  = document.getElementById('chartEmpty');
+
+  if (history.temp.length < 2 && history.tds.length < 2) return;
+
+  empty.style.display = 'none';
+
+  const ctx = canvas.getContext('2d');
+  const W   = canvas.offsetWidth;
+  const H   = 180;
+  canvas.width  = W * window.devicePixelRatio;
+  canvas.height = H * window.devicePixelRatio;
+  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+  ctx.clearRect(0, 0, W, H);
+
+  const PAD = { top: 12, right: 12, bottom: 28, left: 40 };
+  const cW  = W - PAD.left - PAD.right;
+  const cH  = H - PAD.top  - PAD.bottom;
+
+  // Grid lines
+  ctx.strokeStyle = '#1c241c';
+  ctx.lineWidth   = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = PAD.top + (cH / 4) * i;
+    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left + cW, y); ctx.stroke();
+  }
+
+  // Draw series
+  function drawLine(data, color, scaleMax) {
+    if (data.length < 2) return;
+    const n     = data.length;
+    const xStep = cW / (MAX_HISTORY - 1);
+    const xOff  = (MAX_HISTORY - n) * xStep;
+
+    // Gradient fill
+    const grad = ctx.createLinearGradient(0, PAD.top, 0, PAD.top + cH);
+    grad.addColorStop(0, color + '22');
+    grad.addColorStop(1, color + '00');
+
+    ctx.beginPath();
+    data.forEach((v, i) => {
+      const x = PAD.left + xOff + i * xStep;
+      const y = PAD.top  + cH - (v / scaleMax) * cH;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    // Close for fill
+    const lastX = PAD.left + xOff + (data.length - 1) * xStep;
+    ctx.lineTo(lastX, PAD.top + cH);
+    ctx.lineTo(PAD.left + xOff, PAD.top + cH);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    data.forEach((v, i) => {
+      const x = PAD.left + xOff + i * xStep;
+      const y = PAD.top  + cH - (v / scaleMax) * cH;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = 1.5;
+    ctx.lineJoin    = 'round';
+    ctx.stroke();
+  }
+
+  // Temperatura: escala 0–50°C
+  drawLine(history.temp, '#e8a84c', 50);
+
+  // TDS: escala 0–2000 ppm, dividido por 10 para que entre en el mismo eje visual
+  drawLine(history.tds.map(v => v / 10), '#4caf7d', 200);
+
+  // Eje Y labels (para temperatura)
+  ctx.fillStyle   = '#4a604a';
+  ctx.font        = '10px DM Mono, monospace';
+  ctx.textAlign   = 'right';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i <= 4; i++) {
+    const y   = PAD.top + (cH / 4) * i;
+    const val = Math.round(50 - (50 / 4) * i);
+    ctx.fillText(val + '°', PAD.left - 6, y);
+  }
+
+  // Timestamps en eje X (primero y último)
+  if (history.labels.length >= 2) {
+    ctx.textAlign   = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(history.labels[0], PAD.left, PAD.top + cH + 6);
+    ctx.textAlign = 'right';
+    ctx.fillText(history.labels[history.labels.length - 1], PAD.left + cW, PAD.top + cH + 6);
+  }
+}
+
+/* ══════════════════════════════════════════════════
+   CONTROL
+══════════════════════════════════════════════════ */
+/* Valores preestablecidos de LimitTDS — editá esta lista para cambiarlos */
+const LIMIT_PRESETS = [200, 400, 450, 600, 700, 900];
+
+function onLimitSelect(sel) {
+  const wrap = document.getElementById('customLimitWrap');
+  if (sel.value === '__custom__') {
+    wrap.style.display = 'block';
+    document.getElementById('limitInput').value = '';
+    document.getElementById('limitInput').focus();
+  } else {
+    wrap.style.display = 'none';
+  }
+}
+
+function sendLimit() {
+  const sel   = document.getElementById('limitSelect');
+  const input = document.getElementById('limitInput');
+
+  let val;
+  if (sel.value === '__custom__') {
+    val = parseInt(input.value);
+  } else {
+    val = parseInt(sel.value);
+  }
+
+  if (isNaN(val) || val < 0 || val > 5000) {
+    showAck('⚠ Valor inválido (0–5000)');
+    return;
+  }
+
+  if (!client || !client.isConnected()) {
+    showAck('⚠ Sin conexión al broker');
+    return;
+  }
+
+  currentLimit = val;
+
+  const msg = new Paho.MQTT.Message(String(val));
+  msg.destinationName = TOPICS.limit;
+  msg.qos = 0;
+  client.send(msg);
+
+  log(TOPICS.limit, String(val));
+  showAck('Publicado: ' + val + ' ppm — esperando confirmación...');
+}
+
+function showAck(text) {
+  const el = document.getElementById('ackMsg');
+  el.textContent = text;
+  el.style.opacity = '1';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.opacity = '0'; }, 5000);
+}
+
+/* ══════════════════════════════════════════════════
+   EMAIL — configuración de destino para alertas
+══════════════════════════════════════════════════ */
+
+// Validación básica: algo@algo.algo — suficiente para detectar
+// errores de tipeo obvios sin pretender validar RFC 5322 completo.
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function sendEmail() {
+  const input = document.getElementById('emailInput');
+  const val   = input.value.trim();
+
+  if (!isValidEmail(val)) {
+    showEmailAck('⚠ Formato de email inválido');
+    return;
+  }
+
+  if (!client || !client.isConnected()) {
+    showEmailAck('⚠ Sin conexión al broker');
+    return;
+  }
+
+  const msg = new Paho.MQTT.Message(val);
+  msg.destinationName = TOPICS.email;
+  msg.qos = 0;
+  client.send(msg);
+
+  log(TOPICS.email, val);
+  showEmailAck('Publicado: ' + val + ' — esperando confirmación...');
+}
+
+function showEmailAck(text) {
+  const el = document.getElementById('emailAckMsg');
+  el.textContent = text;
+  el.style.opacity = '1';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.opacity = '0'; }, 5000);
+}
+
+function updateCurrentEmail(email) {
+  const hasEmail = email && email.length > 0;
+
+  // Actualizar sección de control (campo de email)
+  const inputEl = document.getElementById('emailInput');
+  if (inputEl && hasEmail) inputEl.placeholder = email;
+
+  // Mostrar en el header
+  const headerEl  = document.getElementById('headerEmail');
+  const headerVal = document.getElementById('headerEmailVal');
+  if (hasEmail) {
+    headerEl.style.display = 'flex';
+    headerVal.textContent  = email;
+  } else {
+    headerEl.style.display = 'none';
+  }
+}
+
+/* ══════════════════════════════════════════════════
+   LOG
+══════════════════════════════════════════════════ */
+function log(topic, val) {
+  const body  = document.getElementById('logBody');
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+
+  const shortTopic = topic === 'sys'
+    ? '<span style="color:var(--muted)">[sistema]</span>'
+    : '<span class="log-topic">' + topic.replace('HidroUNLAM/', '') + '</span>';
+
+  entry.innerHTML =
+    '<span class="log-time">' + timeStr() + '</span>' +
+    shortTopic +
+    '<span class="log-val">' + val + '</span>';
+
+  body.appendChild(entry);
+  body.scrollTop = body.scrollHeight;
+
+  // Limitar a 100 entradas
+  while (body.children.length > 100) body.removeChild(body.firstChild);
+}
+
+function clearLog() {
+  document.getElementById('logBody').innerHTML = '';
+}
+
+/* ══════════════════════════════════════════════════
+   HELPERS
+══════════════════════════════════════════════════ */
+function setConnState(state, text) {
+  const badge = document.getElementById('connBadge');
+  badge.className = 'conn-badge ' + state;
+  document.getElementById('connText').textContent = text;
+}
+
+function timeStr() {
+  const n = new Date();
+  return n.getHours().toString().padStart(2,'0') + ':' +
+         n.getMinutes().toString().padStart(2,'0') + ':' +
+         n.getSeconds().toString().padStart(2,'0');
+}
+
+// Redibujar chart al cambiar tamaño de ventana
+window.addEventListener('resize', () => {
+  if (history.temp.length > 1 || history.tds.length > 1) drawChart();
+});
+
+// Arrancar
+connect();
+</script>
+</body>
+</html>
