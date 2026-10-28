@@ -907,12 +907,23 @@ function onMessage(msg) {
     const match     = payload.match(/(-?\d+)/);
     const tempMatch = payload.match(/temp:(\w+)/);
 
-    if (match) {
-      const val = parseInt(match[1]);
-      updateTemp(val, now);
-      pushHistory('temp', val, now);
+if (match) {
+  const val = parseInt(match[1]);
+
+  if (val < -10 || val > 50) {
+    log('sys', 'Temperatura descartada: ' + val + '°C fuera de rango');
+    // Republicar el último valor válido para mantener el historial alineado
+    if (history.temp.length > 0) {
+      const lastValid = history.temp[history.temp.length - 1];
+      pushHistory('temp', lastValid, now);
       drawChart();
     }
+  } else {
+    updateTemp(val, now);
+    pushHistory('temp', val, now);
+    drawChart();
+  }
+}
 
     if (tempMatch) {
       updateTempAlert(tempMatch[1]);
